@@ -10,22 +10,36 @@ final class Controller: NSObject, NSApplicationDelegate, NSTableViewDataSource, 
     let store = SettingsStore()
     var settings = Settings(devices: [])
     var devices: [OutputDevice] = []
-    let domain = "gui/\(getuid())"
-    let service = "local.audio-priority"
     var listener: AudioObjectPropertyListenerBlock?
-
-    func launch(_ arguments: [String]) -> Int32 {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        process.arguments = arguments
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do { try process.run(); process.waitUntilExit(); return process.terminationStatus }
-        catch { return -1 }
-    }
-    var running: Bool { launch(["print", domain + "/" + service]) == 0 }
+    let serviceManager = ServiceManager()
+    var running: Bool { serviceManager.running }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let applicationURL = Bundle.main.bundleURL.resolvingSymlinksInPath()
+        let userApplications = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications").path + "/"
+        guard applicationURL.path.hasPrefix("/Applications/") || applicationURL.path.hasPrefix(userApplications) else {
+            let notice = NSAlert()
+            notice.messageText = "请先安装到应用程序"
+            notice.informativeText = "将“音频自动切换”拖到“应用程序”文件夹，再从那里打开。"
+            notice.addButton(withTitle: "打开应用程序文件夹")
+            notice.addButton(withTitle: "关闭")
+            NSApp.activate(ignoringOtherApps: true)
+            if notice.runModal() == .alertFirstButtonReturn {
+                NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications"))
+            }
+            NSApp.terminate(nil)
+            return
+        }
+        do {
+            _ = try store.update(connected: outputDevices())
+            try serviceManager.configure()
+        } catch {
+            let notice = NSAlert()
+            notice.messageText = "自动配置未完成"
+            notice.informativeText = error.localizedDescription
+            NSApp.activate(ignoringOtherApps: true)
+            notice.runModal()
+        }
         window.title = "音频自动切换"
         window.minSize = NSSize(width: 520, height: 340)
         let root = NSView()
@@ -70,6 +84,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSTableViewDataSource, 
         let menu = NSMenu()
         let item = NSMenuItem()
         let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "停用并移除登录后台项", action: #selector(removeService), keyEquivalent: "")
+        appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "退出控制窗口", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.submenu = appMenu
         menu.addItem(item)
@@ -99,12 +115,30 @@ final class Controller: NSObject, NSApplicationDelegate, NSTableViewDataSource, 
         message.stringValue = active ? "已启用 · 关闭窗口后后台继续运行" : "已暂停 · 下次登录将自动启用"
     }
     @objc func toggleService() {
-        let args = running ? ["bootout", domain + "/" + service] : ["bootstrap", domain, FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/" + service + ".plist").path]
-        guard launch(args) == 0 else {
-            message.stringValue = "服务操作失败，请检查安装。"
+        let succeeded = running ? serviceManager.stop() : serviceManager.start()
+        guard succeeded else {
+            message.stringValue = "服务操作失败，请在系统设置中检查登录项。"
             return
         }
         updateStatus()
+    }
+    @objc func removeService() {
+        let notice = NSAlert()
+        notice.messageText = "停用登录后台项？"
+        notice.informativeText = "自动切换将停止。设备排序仍会保留，退出后可删除 App。再次打开 App 会重新配置后台服务。"
+        notice.addButton(withTitle: "取消")
+        notice.addButton(withTitle: "停用并退出")
+        guard notice.runModal() == .alertSecondButtonReturn else { return }
+        if running && !serviceManager.stop() {
+            message.stringValue = "无法停止后台服务，请稍后重试。"
+            return
+        }
+        do {
+            if FileManager.default.fileExists(atPath: serviceManager.agent.path) {
+                try FileManager.default.removeItem(at: serviceManager.agent)
+            }
+            NSApp.terminate(nil)
+        } catch { message.stringValue = "移除登录项失败：\(error.localizedDescription)" }
     }
     func numberOfRows(in tableView: NSTableView) -> Int { settings.devices.count }
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
